@@ -249,48 +249,6 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
 
     return eval_result, total_flops
 
-def cache_split_data(args, client_data, cache_type="louvain"):
-    """
-    Different types of data caches are kept.
-    :param args: Parameter object that contains relevant configuration information
-    :param client_data: The data to cache.
-    :param cache_type: Cache type, "louvain" to hold the Louvain segmentation results, "processed" to hold the client_data after final processing.
-    """
-    if cache_type == "louvain":
-        file_name = f"{args.is_iid}_{args.num_workers}_louvain_split.pkl"
-    elif cache_type == "processed":
-        file_name = f"{args.is_iid}_{args.num_workers}_processed_client_data.pkl"
-
-    file_path = os.path.join("cache", file_name)
-
-    if not os.path.exists("cache"):
-        os.makedirs("cache")
-
-    with open(file_path, 'wb') as f:
-        pickle.dump(client_data, f)
-
-    print(f"Data split saved to {file_path}")
-
-def load_cached_data(args, cache_type="louvain"):
-    """
-    Load different types of data caches.
-    :param args: Parameter object that contains relevant configuration information
-    :param cache_type: Cache type, "louvain" to load the Louvain segmentation result, "processed" to load the final processed client_data.
-    :return: client-side data to load, or None if the cache doesn't exist
-    """
-    if cache_type == "louvain":
-        file_name = f"{args.is_iid}_{args.num_workers}_louvain_split.pkl"
-    elif cache_type == "processed":
-        file_name = f"{args.is_iid}_{args.num_workers}_processed_client_data.pkl"
-
-    file_path = os.path.join("cache", file_name)
-
-    if os.path.exists(file_path):
-        with open(file_path, 'rb') as f:
-            client_data = pickle.load(f)
-        print(f"Loaded cached data from {file_path}")
-        return client_data
-    return None
 
 def extract_node_features(client_data, num_workers,aggr='add',idx=None):
     file_path = 'node_features/Client_workers_{}_{}_init_node_features_{}.pt'.format(num_workers,idx, aggr)
@@ -339,10 +297,8 @@ def main():
     criterion = torch.nn.BCEWithLogitsLoss()
     print('=' * 20 + 'Start Splitting the Data' + '=' * 20)
 
-    client_data = load_cached_data(args, cache_type="louvain")
     if client_data is None:
         client_data = split_Louvain(args, data)
-        cache_split_data(args, client_data, cache_type="louvain")
 
     for i in range(args.num_workers):
         print(f"Client {i} data length: {len(client_data[i])}")
