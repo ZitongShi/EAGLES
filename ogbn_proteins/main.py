@@ -47,13 +47,13 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
 
     if use_topo:
         try:
-            model.learner.get_topo_val(edges_index_mapped)
+            model.expert.get_topo_val(edges_index_mapped)
             print("Successfully called get_topo_val on learner.")
         except Exception as e:
             print(f"Error calling get_topo_val: {e}")
 
     try:
-        mask, add_loss = model.learner(train_x, edges_index_mapped, temp, edges_attr_mapped, True)
+        mask, add_loss = model.expert(train_x, edges_index_mapped, temp, edges_attr_mapped, True)
     except Exception as e:
         print(f"Error during model.learner forward pass: {e}")
         raise
@@ -118,9 +118,9 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
     test_idx = test_idx.to(device)
 
     if use_topo:
-        model.learner.get_topo_val(client_graph.edge_index)
+        model.expert.get_topo_val(client_graph.edge_index)
 
-    mask, add_loss = model.learner(client_graph.x, client_graph.edge_index, temp, client_graph.edge_attr, False)
+    mask, add_loss = model.expert(client_graph.x, client_graph.edge_index, temp, client_graph.edge_attr, False)
 
     if mask is None:
         raise ValueError("mask returned from model.learner is None.")
@@ -307,6 +307,10 @@ def main():
         current_pruning_index = None
         total_pruning_points = None
 
+    total_upload_bytes = 0
+    total_download_bytes = 0
+    total_bytes =0
+
     for epoch in range(1, args.epochs + 1):
         if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
             current_pruning_point = pruning_ranges[current_pruning_index]
@@ -382,6 +386,13 @@ def main():
             )
             print(f"Client {client_idx} Evaluation Results: {result}, sparse ratio: {100 * np.mean(all_sparsity_innner_epoch):.2f}%")
             print(f"Client {client_idx} Weight Mask Ratio: {100 * np.mean(all_wei_mask_inner_ratio):.2f}%")
+
+        if args.spar_wei == 1:
+            global_model, client_models,average_wei_mask_ratio = EAGLE_AGG(global_model, client_models, args)
+
+        else:
+            average_wei_mask_ratio = 1
+            global_model  = fed_avg(global_model, client_models)
 
 
         if 'train' in result:

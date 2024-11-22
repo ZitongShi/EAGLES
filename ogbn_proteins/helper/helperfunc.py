@@ -12,7 +12,7 @@ import numpy as np
 import math
 import logging
 import ot
-from ogbn_proteins.module.moe import MoE
+from ogbn_proteins.module.moe import moe
 from ogbn_proteins.module.gnn_conv import MaskedLinear
 
 def load_masks_into_model(model, masks, fixed=True):
@@ -145,7 +145,7 @@ def EAGLE_AGG(global_model, client_models, args):
         else:
             print(f"Client {client_idx} does not have a 'learner' module.")
             raise AttributeError(f"Client {client_idx} does not have a 'learner' module.")
-        if moe and isinstance(moe, MoE):
+        if moe and isinstance(moe, moe):
             if hasattr(moe, 'w_gate'):
                 w_gate = moe.w_gate.clone().detach()
                 client_w_gates.append(w_gate)
