@@ -186,64 +186,7 @@ def EAGLE_AGG(global_model, client_models, args):
     personalized_state_dicts = {client_idx: {} for client_idx in range(num_clients)}
     model_keys = global_model.state_dict().keys()
     client_state_dicts = [client_model.state_dict() for client_model in client_models]
-    if args.spar_wei == 1 and args.save_spar_wei == 1 and args.load_spar_wei == 0:
-        for client_idx, client_model in enumerate(client_models):
-            state_dict = client_state_dicts[client_idx]
-            gnn_params = {k: v for k, v in state_dict.items() if 'gnn' in k}
-            gnn_bytes = sum(v.numel() * v.element_size() for v in gnn_params.values())
-            learner = getattr(client_model, 'learner', None)
-            moe_bytes = 0
-            if learner:
-                w_gate = getattr(learner, 'w_gate', None)
-                if w_gate is not None:
-                    moe_bytes += w_gate.numel() * w_gate.element_size()
-                experts = getattr(learner, 'experts', None)
-                if experts:
-                    for expert in experts:
-                        for param in expert.parameters():
-                            moe_bytes += param.numel() * param.element_size()
-            masks = [layer.mask for layer in client_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-            mask_bytes = sum(mask.numel() * mask.element_size() for mask in masks) / 8
-            upload_bytes = gnn_bytes + moe_bytes + mask_bytes
-            print(f"Client {client_idx} upload bytes: {upload_bytes} Bytes")
-        download_bytes_per_client = 0
-        for layer, union_mask in zip(masked_linear_layers, union_wei_masks):
-            non_zero_mask = (union_mask != 0)
-            non_zero_params = layer.weight[non_zero_mask].numel()
-            download_bytes_per_client += non_zero_params * layer.weight.element_size()
-        total_download_bytes = download_bytes_per_client * num_clients
-        print(f"Server download parameter mask consensus bytes: {total_download_bytes} Bytes")
 
-    elif args.spar_wei == 1 and args.save_spar_wei == 0 and args.load_spar_wei == 1:
-        global_mask = [layer.mask.clone().detach() for layer in global_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-
-        total_unmasked_gnn_bytes = 0
-        masked_linear_layers = [layer for layer in global_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-        for layer, mask in zip(masked_linear_layers, global_mask):
-            unmasked_params_num = mask.sum().item()
-            total_unmasked_gnn_bytes += unmasked_params_num * layer.weight.element_size()
-
-        for client_idx, client_model in enumerate(client_models):
-            gnn_bytes = 0
-            client_masked_layers = [layer for layer in client_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-            for layer, mask in zip(client_masked_layers, global_mask):
-                unmasked_params_num = mask.sum().item()
-                gnn_bytes += unmasked_params_num * layer.weight.element_size()
-            learner = getattr(client_model, 'learner', None)
-            moe_bytes = 0
-            if learner:
-                w_gate = getattr(learner, 'w_gate', None)
-                if w_gate is not None:
-                    moe_bytes += w_gate.numel() * w_gate.element_size()
-                experts = getattr(learner, 'experts', None)
-                if experts:
-                    for expert in experts:
-                        for param in expert.parameters():
-                            moe_bytes += param.numel() * param.element_size()
-            upload_bytes = gnn_bytes + moe_bytes
-            print(f"Client {client_idx} upload bytes: {upload_bytes} Bytes")
-        total_download_bytes = total_unmasked_gnn_bytes * num_clients
-        print(f"Server download parameter mask consensus bytes: {total_download_bytes} Bytes")
 
     for key in model_keys:
         params = [client_state_dict[key].float() for client_state_dict in client_state_dicts]
