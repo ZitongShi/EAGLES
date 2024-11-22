@@ -297,8 +297,7 @@ def main():
     criterion = torch.nn.BCEWithLogitsLoss()
     print('=' * 20 + 'Start Splitting the Data' + '=' * 20)
 
-    if client_data is None:
-        client_data = split_Louvain(args, data)
+    client_data = split_Louvain(args, data)
 
     for i in range(args.num_workers):
         print(f"Client {i} data length: {len(client_data[i])}")
