@@ -139,7 +139,7 @@ def load_masks_into_model(model, masks, fixed=True):
 
     masked_layers = [layer for layer in model.gnn.modules() if isinstance(layer, MaskedLinear)]
     if len(masks) != len(masked_layers):
-        raise ValueError("加载的 mask 数量与模型中的 MaskedLinear 层数不匹配。")
+        raise ValueError("The number of masks loaded does not match the number of MaskedLinear layers in the model.")
 
     for layer, mask in zip(masked_layers, masks):
         if layer.mask is None:
@@ -156,7 +156,7 @@ def main():
     print(f"Number of available GPUs: {num_available_gpus}")
     device = torch.device("cuda:" + str(args['device'])) if torch.cuda.is_available() else torch.device("cpu")
 
-    if args['dataset'] == 'ogbn-arxiv':
+    if args['dataset'] == 'ogbn-arxiv' or args['dataset'] == 'ogbn-products':
         dataset = PygNodePropPredDataset(name=f"{args['dataset']}", root='./data/')
         print(f'Dataset: {dataset}:')
         print('======================')
