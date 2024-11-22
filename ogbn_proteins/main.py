@@ -63,15 +63,8 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
     if add_loss is None:
         raise ValueError("add_loss returned from model.learner is None.")
 
-    total_flops = 0
-
     num_edges = mask.numel()
     num_masks = mask.sum().item()
-    feature_dim = train_x.shape[1]
-    # 假设每个特征维度涉及一次乘法和一次加法
-    message_passing_flops = 2 * num_masks * feature_dim
-    total_flops += message_passing_flops
-    print(f"Message Passing FLOPs: {message_passing_flops}")
 
     try:
         if args.spar_wei == 1:
@@ -81,75 +74,6 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
     except Exception as e:
         print(f"Error during model.gnn forward pass: {e}")
         raise
-
-    num_nodes = train_x.shape[0]
-    total_mask_ratio = 0
-    if args.spar_wei == 1:
-        # 稀疏线性层 FLOPs
-        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, MaskedLinear)]
-        total_non_zero_weights = 0
-        total_num_weights = 0
-        for layer in linear_layers:
-            non_zero_weights = (layer.mask == 1).sum().item()
-            total_weights = layer.mask.numel()
-            total_non_zero_weights += non_zero_weights
-            total_num_weights += total_weights
-            flops = 2 * num_nodes * non_zero_weights
-            total_flops += flops
-            #print(f"MaskedLinear Layer FLOPs: {flops}")
-        if total_num_weights > 0:
-            total_mask_ratio = total_non_zero_weights / total_num_weights
-        else:
-            total_mask_ratio = 0.0
-    else:
-        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, nn.Linear)]
-        for layer in linear_layers:
-            in_features = layer.in_features
-            out_features = layer.out_features
-            flops = 2 * num_nodes * in_features * out_features
-            total_flops += flops
-            print(f"Linear Layer FLOPs: {flops}")
-
-    moe_flops = 0
-
-    input_size = model.learner.w_gate.shape[0]
-    num_experts = model.learner.num_experts
-
-    gate_flops = 2 * num_nodes * input_size * num_experts  # Multiply and Add
-    moe_flops += gate_flops
-    print(f"MoE Gate Linear Transformation FLOPs: {gate_flops}")
-
-    softmax_flops = 2 * num_nodes * num_experts
-    topk_flops = num_nodes * num_experts * math.log(num_experts, 2)
-    moe_flops += softmax_flops + topk_flops
-    print(f"MoE Softmax FLOPs: {softmax_flops}, Top-K FLOPs: {topk_flops}")
-
-    for expert in model.learner.experts:
-        for layer in expert.layers:
-            in_features = layer.in_features
-            out_features = layer.out_features
-            flops = 2 * num_nodes * in_features * out_features
-            moe_flops += flops
-            print(f"MoE Expert Layer FLOPs: {flops}")
-
-    total_flops += moe_flops
-    print(f"MoE Total FLOPs: {moe_flops}")
-
-    relu_flops = train_x.numel()
-    total_flops += relu_flops
-    print(f"ReLU FLOPs: {relu_flops}")
-
-    bn_layers = [layer for layer in model.gnn.modules() if isinstance(layer, nn.BatchNorm1d)]
-    for bn in bn_layers:
-        bn_flops = 2 * bn.num_features * num_nodes
-        total_flops += bn_flops
-        print(f"BatchNorm FLOPs: {bn_flops}")
-
-    binary_step_flops = num_edges
-    total_flops += binary_step_flops
-    print(f"BinaryStep FLOPs: {binary_step_flops}")
-
-    print(f"Total FLOPs in this iteration: {total_flops}")
 
     target = train_y.to(torch.float32)
 
@@ -174,8 +98,8 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
     print(f"Loss: {loss.item()}, pruning ratio: {100 * pruning_ratio:.2f}%")
 
     if args.spar_wei == 0:
-        return statistics.mean(loss_list), pruning_ratio, total_flops, 1
-    return statistics.mean(loss_list), pruning_ratio, total_flops, total_mask_ratio
+        return statistics.mean(loss_list), pruning_ratio
+    return statistics.mean(loss_list), pruning_ratio
 
 @torch.no_grad()
 def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, train_idx=None, valid_idx=None,
@@ -214,20 +138,9 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
         print(f"Error during model.gnn forward pass: {e}")
         raise
 
-    num_edges = mask.numel()
     num_masks = mask.sum().item()
     feature_dim = client_graph.x.shape[1]
-    message_passing_flops = num_masks * feature_dim
-    num_nodes = client_graph.x.shape[0]
 
-    if args.spar_wei == 1:
-        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, MaskedLinear)]
-        feature_transform_flops = sum(2 * num_nodes * (layer.mask == 1).sum().item() for layer in linear_layers)
-    else:
-        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, torch.nn.Linear)]
-        feature_transform_flops = sum(2 * num_nodes * layer.in_features * layer.out_features for layer in linear_layers)
-
-    total_flops = message_passing_flops + feature_transform_flops
     target = client_graph.y.cpu()
 
     train_pred = pred[train_idx.cpu()].cpu().numpy()
@@ -249,7 +162,7 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
     input_dict = {"y_true": test_y, "y_pred": test_pred}
     eval_result["test"] = evaluator.eval(input_dict)
 
-    return eval_result, total_flops
+    return eval_result
 
 
 def extract_node_features(client_data, num_workers,aggr='add',idx=None):
@@ -394,10 +307,6 @@ def main():
         current_pruning_index = None
         total_pruning_points = None
 
-    total_upload_bytes = 0
-    total_download_bytes = 0
-    total_bytes =0
-
     for epoch in range(1, args.epochs + 1):
         if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
             current_pruning_point = pruning_ranges[current_pruning_index]
@@ -428,10 +337,6 @@ def main():
         all_test_results = []
         all_sparsity = []
         all_wei_mask_ratio = []
-        total_flops_per_epoch = 0
-        total_flops_per_epoch_eval = 0
-        all_client_train_flops = []
-        all_client_eval_flops = []
         for client_idx in range(args.num_workers):
 
             optimizer = optimizers[client_idx]
@@ -447,7 +352,7 @@ def main():
                     temp = max(0.05, decay_temp)
                     logging.debug(f"Updated temperature: {temp}")
 
-                epoch_loss, sparsity,flops,wei_mask_ratio = train(
+                epoch_loss, sparsity = train(
                     client_data[client_idx],
                     train_idx,
                     valid_idx,
@@ -458,16 +363,14 @@ def main():
                     device,
                     args,
                     args.use_topo)
-                total_flops_per_epoch += flops
 
                 if inner_epoch == 1:
                     print(f"Client {client_idx}:")
                 print(f"Inner Epoch {inner_epoch}, Loss: {epoch_loss:.4f}, sparse ratio: {100 * sparsity:.2f}%")
                 all_sparsity_innner_epoch.append(sparsity)
-                all_wei_mask_inner_ratio.append(wei_mask_ratio)
             all_sparsity.append(np.mean(all_sparsity_innner_epoch) if all_sparsity_innner_epoch else 0.0)
             all_wei_mask_ratio.append(np.mean(all_wei_mask_inner_ratio) if all_wei_mask_inner_ratio else 0.0)
-            result,eval_flops = multi_evaluate(
+            result = multi_evaluate(
                 client_data[client_idx],
                 client_models[client_idx],
                 evaluator,
@@ -477,29 +380,9 @@ def main():
                 train_idx, valid_idx, test_idx,
                 args=args
             )
-            total_flops_per_epoch_eval += eval_flops
-            total_flops_per_epoch = total_flops_per_epoch / args.inner_epochs
-            all_client_train_flops.append(total_flops_per_epoch)
-            all_client_eval_flops.append(total_flops_per_epoch_eval)
             print(f"Client {client_idx} Evaluation Results: {result}, sparse ratio: {100 * np.mean(all_sparsity_innner_epoch):.2f}%")
-            print(f"Client {client_idx} train flops: {total_flops_per_epoch}, eval flops: {total_flops_per_epoch_eval}")
             print(f"Client {client_idx} Weight Mask Ratio: {100 * np.mean(all_wei_mask_inner_ratio):.2f}%")
 
-        if args.spar_wei == 1:
-            global_model, client_models, communication_bytes,average_wei_mask_ratio = EAGLE_AGG(global_model, client_models, args)
-            total_upload_bytes += communication_bytes['upload_bytes']
-            total_download_bytes += communication_bytes['download_bytes']
-            total_bytes += communication_bytes['upload_bytes'] + communication_bytes['download_bytes']
-        else:
-            average_wei_mask_ratio = 1
-            global_model, upload_bytes, download_bytes = fed_avg(global_model, client_models)
-            communication_bytes = {
-                'upload_bytes': upload_bytes,
-                'download_bytes': download_bytes
-            }
-            total_upload_bytes += communication_bytes['upload_bytes']
-            total_download_bytes += communication_bytes['download_bytes']
-            total_bytes += communication_bytes['upload_bytes'] + communication_bytes['download_bytes']
 
         if 'train' in result:
             all_train_results.append(result['train']['rocauc'])
@@ -511,16 +394,13 @@ def main():
         average_valid_acc = np.mean(all_valid_results) if all_valid_results else 0.0
         average_test_acc = np.mean(all_test_results) if all_test_results else 0.0
         average_sparsity = np.mean(all_sparsity) if all_sparsity else 0.0
-        average_train_flops = np.mean(all_client_train_flops) if all_client_train_flops else 0.0
-        average_eval_flops = np.mean(all_client_eval_flops) if all_client_eval_flops else 0.0
         print(f'Average Accuracy across all clients: train ROC AUC:{100 * average_train_acc:.2f}, '
               f'valid ROC AUC:{100 * average_valid_acc:.2f}, test ROC AUC:{100 * average_test_acc:.2f}%')
         print(f'Average Sparsity across all clients: {100 * average_sparsity:.2f}%')
-        print(f'Average FLOPs across all clients: train FLOPs:{average_train_flops}, eval FLOPs:{average_eval_flops}')
         print(f'Average Weight Mask Ratio across all clients: {100 * average_wei_mask_ratio:.2f}%')
 
         with open(acc_file_path, 'a') as acc_file:
-            acc_file.write(f"Epoch:{epoch }, acc:{average_test_acc}, spar:{average_sparsity}, train_flops:{average_train_flops:.4f}, eval_flops:{average_eval_flops}, wei_mask_ratio:{average_wei_mask_ratio}, total_bytes:{total_bytes} \n")
+            acc_file.write(f"Epoch:{epoch }, acc:{average_test_acc}, spar:{average_sparsity} \n")
 
         if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
             current_w2loss = args.w2loss
