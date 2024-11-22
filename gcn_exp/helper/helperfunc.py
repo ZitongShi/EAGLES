@@ -1,3 +1,12 @@
+import os
+
+import numpy as np
+import ot
+import torch
+
+from gcn_exp.module.gnn import MaskedLinear
+
+
 def fed_avg(global_model, client_models):
     global_dict = global_model.state_dict()
     for key in global_dict.keys():
