@@ -323,7 +323,6 @@ def main():
     pruning_rate_history = []
     best_acc_within_range = defaultdict(float)
     best_mask_within_range = {}
-    convergence_threshold = 5
     current_epoch = 0
 
     pruning_ranges = [90, 80, 70, 60, 50, 40, 30, 20, 10, 0]
