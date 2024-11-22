@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 import os
 import pickle
 from ogbn_proteins.config.args import ArgsInit
@@ -325,7 +327,7 @@ def main():
     current_epoch = 0
 
     pruning_ranges = [90, 80, 70, 60, 50, 40, 30, 20, 10, 0]
-    pruning_tolerance = 4
+    pruning_tolerance = 3
     loaded_masks = defaultdict(list)
 
     if args.load_spar_wei == 1:
