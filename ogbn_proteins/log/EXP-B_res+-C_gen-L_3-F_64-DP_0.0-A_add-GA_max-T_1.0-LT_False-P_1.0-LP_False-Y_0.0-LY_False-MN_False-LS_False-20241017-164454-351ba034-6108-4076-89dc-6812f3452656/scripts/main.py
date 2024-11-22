@@ -1,18 +1,187 @@
 import os
+import pdb
 import pickle
-from ogbn_proteins.config.args import ArgsInit
-from ogb.nodeproppred import Evaluator
-from torch_geometric.utils import scatter
-from ogbn_proteins.helper.helperfunc import fed_avg, EAGLE_AGG,load_masks_into_model,get_versioned_file_path
-from ogbn_proteins.module.gnn_conv import MaskedLinear
-from ogbn_proteins.helper.split import split_Louvain
-from ogbn_proteins.module.model import model
+import torch_geometric.utils as tg_utils
+
 import torch
-import torch.nn as nn
+import torch.optim as optim
 import statistics
+from dataset import OGBNDataset
+from args import ArgsInit
+import time
 import numpy as np
-import math
+from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
+from torch_geometric.utils import scatter
+
+from gnn_conv import MaskedLinear
+from split import split_Louvain
+from utils import save_ckpt,intersection, process_indexes
 import logging
+from MoG import MoG
+
+def intersection(lst1, lst2):
+    return list(set(lst1) & set(lst2))
+
+def random_partition_graph(num_nodes, cluster_number=10):
+    """
+    Randomly partition the nodes into different clusters.
+    :param num_nodes: The total number of nodes in the graph
+    :param cluster_number: The number of clusters
+    :return an array of length num_nodes where each element represents the cluster number to which the node belongs
+    """
+    parts = np.random.randint(0, cluster_number, size=num_nodes)
+    return parts
+
+def create_edge_index_dict(edge_index):
+    """
+    A dictionary is created based on edge_index for quick edge lookup.
+    :param edge_index: Edge index of the graph, of shape [2, num_edges]
+    :return: A dictionary that maps (node 1, node 2) to the index of the edge
+    """
+    edge_index_dict = {}
+    edge_index_np = edge_index.numpy()
+
+    for idx in range(edge_index_np.shape[1]):
+        node_pair = (edge_index_np[0, idx], edge_index_np[1, idx])
+        edge_index_dict[node_pair] = idx
+
+    return edge_index_dict
+
+def generate_sub_graphs(data, parts, cluster_number=10, batch_size=1):
+    """
+    The subgraph is generated according to the partition result.
+    :param data: Raw graph data
+    :param parts: An array of partitioned cluster labels
+    :param cluster_number: The number of clusters
+    :param batch_size: Number of clusters per batch
+    :return: node, edge, edge index, and original edge list of the subgraph
+    """
+    no_of_batches = cluster_number // batch_size
+    print('The number of clusters: {}'.format(cluster_number))
+    sg_nodes = [[] for _ in range(no_of_batches)]
+    sg_edges = [[] for _ in range(no_of_batches)]
+    sg_edges_orig = [[] for _ in range(no_of_batches)]
+    sg_edges_index = [[] for _ in range(no_of_batches)]
+    edges_no = 0
+    edge_index = data.edge_index
+    edge_index_dict = create_edge_index_dict(edge_index)
+
+    for cluster in range(no_of_batches):
+        sg_nodes[cluster] = torch.tensor(np.where(parts == cluster)[0], dtype=torch.long)
+        sg_edges[cluster] = tg_utils.subgraph(sg_nodes[cluster], edge_index, relabel_nodes=True)[0]  # 提取子图的边
+        edges_no += sg_edges[cluster].shape[1]
+        # mapper
+        mapper = {nd_idx: nd_orig_idx for nd_idx, nd_orig_idx in enumerate(sg_nodes[cluster])}
+        # map edges to original edges
+        sg_edges_orig[cluster] = edge_list_mapper(mapper, sg_edges[cluster])
+        # edge index
+        sg_edges_index[cluster] = [edge_index_dict.get((edge[0], edge[1]), -1) for edge in sg_edges_orig[cluster].t().numpy()]
+        sg_edges_index[cluster] = [idx for idx in sg_edges_index[cluster] if idx != -1]
+
+    print('Total number edges of sub graphs: {}, of whole graph: {}, {:.2f} % edges are lost'.
+          format(edges_no, data.num_edges, (1 - edges_no / data.num_edges) * 100))
+
+    return sg_nodes, sg_edges, sg_edges_index, sg_edges_orig
+
+def edge_list_mapper(mapper, sg_edges_list):
+    """
+    Map the edge index in sg_edges_list to the corresponding index value of the mapper.
+    :param mapper: A node mapping dictionary that maps the original node ID to the new node ID
+    :param sg_edges_list: The original edge list
+    :return: The mapped edge list
+    """
+    idx_1st = list(map(lambda x: mapper[x], sg_edges_list[0].tolist()))
+    idx_2nd = list(map(lambda x: mapper[x], sg_edges_list[1].tolist()))
+    sg_edges_orig = torch.LongTensor([idx_1st, idx_2nd])
+    return sg_edges_orig
+
+def fed_avg(global_model, client_models):
+    """The client model parameters are aggregated using FedAvg"""
+    global_dict = global_model.state_dict()
+    for key in global_dict.keys():
+        global_dict[key] = torch.zeros_like(global_dict[key], device=global_dict[key].device)
+    for client_model in client_models:
+        client_dict = client_model.state_dict()
+        for key in global_dict.keys():
+            global_dict[key] += client_dict[key].to(global_dict[key].device)
+    for key in global_dict.keys():
+        global_dict[key] = global_dict[key] / len(client_models)
+    global_model.load_state_dict(global_dict)
+
+    return global_model
+
+def my_fedaggregation(global_model, client_models, args):
+    """
+    Perform federated aggregation using the proposed method.
+    :param global_model: The global model
+    :param client_models: The list of client models
+    :param args: The arguments
+    :return: The updated global model
+    """
+
+    # Step 1: Get wei_mask from each client
+    client_wei_masks = []
+    for client_model in client_models:
+        wei_masks = []
+        for layer in client_model.gnn.modules():
+            if isinstance(layer, MaskedLinear):
+                # Ensure that layer.mask is detached from computation graph
+                wei_masks.append(layer.mask.clone().detach())
+        client_wei_masks.append(wei_masks)
+
+    # Step 2: Get the union of wei_mask from each client
+    # Assuming masks are binary (0 or 1), union is the element-wise maximum
+    num_clients = len(client_models)
+    num_layers = len(client_wei_masks[0])  # Number of MaskedLinear layers
+    union_wei_masks = []
+    for layer_idx in range(num_layers):
+        # Start with the mask from the first client
+        union_mask = client_wei_masks[0][layer_idx].clone()
+        for client_idx in range(1, num_clients):
+            union_mask = torch.max(union_mask, client_wei_masks[client_idx][layer_idx])
+        union_wei_masks.append(union_mask)
+
+    # Step 3: Update global_model's wei_mask using the union wei_mask
+    masked_linear_layers = [layer for layer in global_model.gnn.modules() if isinstance(layer, MaskedLinear)]
+    for layer, union_mask in zip(masked_linear_layers, union_wei_masks):
+        layer.mask = union_mask.clone()
+
+    # Step 4: Compute the change in wei_mask for each client
+    client_mask_changes = []
+    for client_idx in range(num_clients):
+        total_weights = 0
+        changed_weights = 0
+        for layer_idx in range(num_layers):
+            client_mask = client_wei_masks[client_idx][layer_idx]
+            union_mask = union_wei_masks[layer_idx]
+            total_weights += client_mask.numel()
+            changed_weights += (client_mask != union_mask).sum().item()
+        mask_change_ratio = changed_weights / total_weights
+        client_mask_changes.append(mask_change_ratio)
+
+    # Step 5: Compute the aggregation weight for each client
+    # Clients with less mask change get higher weight
+    client_weights = [1.0 - change for change in client_mask_changes]
+    total_weight = sum(client_weights)
+    if total_weight == 0:
+        # If all clients have completely different masks, use equal weights
+        client_weights = [1.0 / num_clients] * num_clients
+    else:
+        client_weights = [w / total_weight for w in client_weights]
+
+    # Step 6: Use the aggregation weight to update the parameters of global_model
+    global_state_dict = global_model.state_dict()
+    for key in global_state_dict.keys():
+        global_state_dict[key] = torch.zeros_like(global_state_dict[key])
+
+    for client_weight, client_model in zip(client_weights, client_models):
+        client_state_dict = client_model.state_dict()
+        for key in global_state_dict.keys():
+            global_state_dict[key] += client_weight * client_state_dict[key]
+
+    global_model.load_state_dict(global_state_dict)
+
+    return global_model
 
 def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criterion, temp, device, args, use_topo=True):
     loss_list = []
@@ -61,15 +230,13 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
     if add_loss is None:
         raise ValueError("add_loss returned from model.learner is None.")
 
-    total_flops = 0
-
     num_edges = mask.numel()
     num_masks = mask.sum().item()
     feature_dim = train_x.shape[1]
-    # 假设每个特征维度涉及一次乘法和一次加法
-    message_passing_flops = 2 * num_masks * feature_dim
-    total_flops += message_passing_flops
-    print(f"Message Passing FLOPs: {message_passing_flops}")
+    message_passing_flops = num_masks * feature_dim
+    total_flops = message_passing_flops
+
+    print(f"Total FLOPs in this iteration: {total_flops}")
 
     try:
         if args.spar_wei == 1:
@@ -81,73 +248,24 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
         raise
 
     num_nodes = train_x.shape[0]
-    total_mask_ratio = 0
+    total_num_weights = 0
+    total_mask_ratio = []
     if args.spar_wei == 1:
-        # 稀疏线性层 FLOPs
         linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, MaskedLinear)]
-        total_non_zero_weights = 0
-        total_num_weights = 0
         for layer in linear_layers:
             non_zero_weights = (layer.mask == 1).sum().item()
-            total_weights = layer.mask.numel()
-            total_non_zero_weights += non_zero_weights
-            total_num_weights += total_weights
+            total_num_weights = layer.mask.numel()
+            total_mask_ratio.append(non_zero_weights / total_num_weights)
+            #pdb.set_trace()
             flops = 2 * num_nodes * non_zero_weights
             total_flops += flops
-            #print(f"MaskedLinear Layer FLOPs: {flops}")
-        if total_num_weights > 0:
-            total_mask_ratio = total_non_zero_weights / total_num_weights
-        else:
-            total_mask_ratio = 0.0
     else:
-        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, nn.Linear)]
+        linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, torch.nn.Linear)]
         for layer in linear_layers:
             in_features = layer.in_features
             out_features = layer.out_features
-            flops = 2 * num_nodes * in_features * out_features
+            flops = 2 * num_nodes * in_features * out_features  # 标准 Linear 层的 FLOPs
             total_flops += flops
-            print(f"Linear Layer FLOPs: {flops}")
-
-    moe_flops = 0
-
-    input_size = model.learner.w_gate.shape[0]
-    num_experts = model.learner.num_experts
-
-    gate_flops = 2 * num_nodes * input_size * num_experts  # Multiply and Add
-    moe_flops += gate_flops
-    print(f"MoE Gate Linear Transformation FLOPs: {gate_flops}")
-
-    softmax_flops = 2 * num_nodes * num_experts
-    topk_flops = num_nodes * num_experts * math.log(num_experts, 2)
-    moe_flops += softmax_flops + topk_flops
-    print(f"MoE Softmax FLOPs: {softmax_flops}, Top-K FLOPs: {topk_flops}")
-
-    for expert in model.learner.experts:
-        for layer in expert.layers:
-            in_features = layer.in_features
-            out_features = layer.out_features
-            flops = 2 * num_nodes * in_features * out_features
-            moe_flops += flops
-            print(f"MoE Expert Layer FLOPs: {flops}")
-
-    total_flops += moe_flops
-    print(f"MoE Total FLOPs: {moe_flops}")
-
-    relu_flops = train_x.numel()
-    total_flops += relu_flops
-    print(f"ReLU FLOPs: {relu_flops}")
-
-    bn_layers = [layer for layer in model.gnn.modules() if isinstance(layer, nn.BatchNorm1d)]
-    for bn in bn_layers:
-        bn_flops = 2 * bn.num_features * num_nodes
-        total_flops += bn_flops
-        print(f"BatchNorm FLOPs: {bn_flops}")
-
-    binary_step_flops = num_edges
-    total_flops += binary_step_flops
-    print(f"BinaryStep FLOPs: {binary_step_flops}")
-
-    print(f"Total FLOPs in this iteration: {total_flops}")
 
     target = train_y.to(torch.float32)
 
@@ -157,9 +275,9 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
             for layer in model.gnn.modules():
                 if isinstance(layer, MaskedLinear):
                     wei_loss += args.w2loss * torch.sum(torch.exp(-layer.threshold))
-            loss = criterion(pred.to(torch.float32), target) + add_loss * args.lambda2 + wei_loss
+            loss = criterion(pred.to(torch.float32), target) + add_loss * 0.1 + wei_loss
         else:
-            loss = criterion(pred.to(torch.float32), target) + add_loss * args.lambda2
+            loss = criterion(pred.to(torch.float32), target) + add_loss * 0.1
     except Exception as e:
         print(f"Error during loss computation: {e}")
         raise
@@ -173,7 +291,7 @@ def train(client_graph, train_idx, valid_idx, test_idx, model, optimizer, criter
 
     if args.spar_wei == 0:
         return statistics.mean(loss_list), pruning_ratio, total_flops, 1
-    return statistics.mean(loss_list), pruning_ratio, total_flops, total_mask_ratio
+    return statistics.mean(loss_list), pruning_ratio, total_flops, np.mean(total_mask_ratio)
 
 @torch.no_grad()
 def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, train_idx=None, valid_idx=None,
@@ -216,8 +334,8 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
     num_masks = mask.sum().item()
     feature_dim = client_graph.x.shape[1]
     message_passing_flops = num_masks * feature_dim
-    num_nodes = client_graph.x.shape[0]
 
+    num_nodes = client_graph.x.shape[0]
     if args.spar_wei == 1:
         linear_layers = [layer for layer in model.gnn.modules() if isinstance(layer, MaskedLinear)]
         feature_transform_flops = sum(2 * num_nodes * (layer.mask == 1).sum().item() for layer in linear_layers)
@@ -226,6 +344,8 @@ def multi_evaluate(client_graph, model, evaluator, temp, device,use_topo=True, t
         feature_transform_flops = sum(2 * num_nodes * layer.in_features * layer.out_features for layer in linear_layers)
 
     total_flops = message_passing_flops + feature_transform_flops
+    #print(f"Total FLOPs in evaluation: {total_flops}")
+
     target = client_graph.y.cpu()
 
     train_pred = pred[train_idx.cpu()].cpu().numpy()
@@ -292,8 +412,8 @@ def load_cached_data(args, cache_type="louvain"):
         return client_data
     return None
 
-def extract_node_features(client_data, num_workers,aggr='add',idx=None):
-    file_path = 'node_features/Client_workers_{}_{}_init_node_features_{}.pt'.format(num_workers,idx, aggr)
+def extract_node_features(client_data, aggr='add',idx=None):
+    file_path = 'Client_{}_init_node_features_{}.pt'.format(idx, aggr)
     if os.path.isfile(file_path):
         print('{} exists'.format(file_path))
     else:
@@ -309,17 +429,31 @@ def extract_node_features(client_data, num_workers,aggr='add',idx=None):
         print('Node features extracted are saved into file {}'.format(file_path))
     return file_path
 
+def get_versioned_file_path(file_path):
+    if not os.path.exists(file_path):
+        return file_path
 
+    base, ext = os.path.splitext(file_path)
+    version = 1
+    new_file_path = f"{base}_version_{version}{ext}"
 
+    while os.path.exists(new_file_path):
+        version += 1
+        new_file_path = f"{base}_version_{version}{ext}"
+
+    return new_file_path
 
 def main():
     args = ArgsInit().save_exp()
+
     if args.use_gpu:
         device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
     else:
         device = torch.device("cpu")
+
     logging.info(f'Device: {device}')
 
+    # Load the ogbn-proteins dataset
     from ogb.nodeproppred import PygNodePropPredDataset
     dataset = PygNodePropPredDataset(name='ogbn-proteins', root='./data/')
     data = dataset[0]
@@ -337,6 +471,7 @@ def main():
 
     evaluator = Evaluator(args.dataset)
     criterion = torch.nn.BCEWithLogitsLoss()
+
     print('=' * 20 + 'Start Splitting the Data' + '=' * 20)
 
     client_data = load_cached_data(args, cache_type="louvain")
@@ -358,47 +493,21 @@ def main():
             raise ValueError(f"client_graph {client_idx}.x is None. Please check split_Louvain function.")
 
     print('=' * 20 + 'Start Preparing the Models' + '=' * 20)
-    nf_path = extract_node_features(client_data[0], args.num_workers, 'add', 0)
-    args.nf_path = nf_path
-    global_model = model(data.x.size(1), dataset.num_tasks, args, device).to(device)
+    global_model = MoG(data.x.size(1), dataset.num_tasks, args, device).to(device)
+    os.makedirs('results/acc', exist_ok=True)
+    os.makedirs('results/sparsity', exist_ok=True)
     k_list_str = '_'.join(map(str, args.k_list))
-    w2loss_history = []
-    pruning_rate_history = []
-    best_acc_within_range = defaultdict(float)
-    best_mask_within_range = {}
-    convergence_threshold = 5
-    current_epoch = 0
-
-    pruning_ranges = [90, 80, 70, 60, 50, 40, 30, 20, 10, 0]
-    pruning_tolerance = 4
-    loaded_masks = defaultdict(list)
-
-    if args.load_spar_wei == 1:
-        for pruning_point in pruning_ranges:
-            mask_file_path = f"saved_wei/num_layers_{args.num_layers}_best_masks_pruning_{pruning_point}+-{pruning_tolerance}%.pth"
-            if os.path.exists(mask_file_path):
-                masks = torch.load(mask_file_path)
-                loaded_masks[pruning_point] = masks
-                print(f"Load the pruning rate num_layers_{args.num_layers}_best_masks_pruning_{pruning_point}+-{pruning_tolerance}% mask: {mask_file_path}")
-            else:
-                print(f"A mask file with pruning rate num_layers_{args.num_layers}_best_masks_pruning_{pruning_point}+-{pruning_tolerance}% was not found")
-
-        selected_pruning_rate = args.selected_pruning_rate
-        if selected_pruning_rate in loaded_masks:
-            print(f"The mask with pruning rate {selected_pruning_rate}±{pruning_tolerance}% is assigned to global_model.")
-            load_masks_into_model(global_model, loaded_masks[selected_pruning_rate])
-        else:
-            print(f"Training continues with the mask with the pruning rate {selected_pruning_rate}±{pruning_tolerance}% not loaded.")
-
-    os.makedirs('Aba_results', exist_ok=True)
-    acc_file_path = f"Aba_results/dataset_{args.dataset}_{k_list_str}_lambda2_{args.lambda2}_acc.txt"
+    if args.spar_wei == 1:
+        acc_file_path = f"results/acc/is_spar_wei_{args.spar_wei}_w2loss_{args.w2loss}_{k_list_str}_acc.txt"
+    else:
+        acc_file_path = f"results/acc/is_spar_wei_{args.spar_wei}_{k_list_str}_acc.txt"
     acc_file_path = get_versioned_file_path(acc_file_path)
 
     client_models = []
     for idx in range(args.num_workers):
-        nf_path = extract_node_features(client_data[idx], args.num_workers,'add', idx)
+        nf_path = extract_node_features(client_data[idx], 'add', idx)
         args.nf_path = nf_path
-        client_model = model(data.x.size(1), dataset.num_tasks, args, device).to(device)
+        client_model = MoG(data.x.size(1), dataset.num_tasks, args, device).to(device)
         client_models.append(client_model)
 
     for idx, client_model in enumerate(client_models):
@@ -406,7 +515,7 @@ def main():
         assert client_model is not None, f"client_model {idx} is None before loading state_dict"
         client_model.load_state_dict(global_model.state_dict())
 
-
+    start_time = time.time()
     train_idx_list = []
     valid_idx_list = []
     test_idx_list = []
@@ -426,47 +535,15 @@ def main():
         valid_idx_list.append(valid_idx)
         test_idx_list.append(test_idx)
 
-    optimizers = []
-    for client_model in client_models:
-        optimizer = torch.optim.Adam(client_model.parameters(), lr=args.lr)
-        optimizers.append(optimizer)
-
-    if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-        current_pruning_index = 0
-        total_pruning_points = len(pruning_ranges)
-    else:
-        current_pruning_index = None
-        total_pruning_points = None
-
-    total_upload_bytes = 0
-    total_download_bytes = 0
-    total_bytes =0
-
     for epoch in range(1, args.epochs + 1):
-        if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-            current_pruning_point = pruning_ranges[current_pruning_index]
-            lower_bound = current_pruning_point - pruning_tolerance
-            upper_bound = current_pruning_point + pruning_tolerance
-            print('=' * 20 + f"Epoch {epoch }/{args.epochs} Start (Pruning Point: {current_pruning_point}±{pruning_tolerance}%)" + '=' * 20)
-        else:
-            print('=' * 20 + f"Epoch {epoch }/{args.epochs} Start" + '=' * 20)
+        print('=' * 20 + f"Epoch {epoch }/{args.epochs} Start" + '=' * 20)
 
+        if epoch == 200:
+            pdb.set_trace()
         for client_model in client_models:
-            if args.spar_wei != 1:
-                client_model.load_state_dict(global_model.state_dict())
-            else:
-                pass
-            client_model.to(client_model.device)
-            global_masked_layers = [layer for layer in global_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-            client_masked_layers = [layer for layer in client_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-            for global_layer, client_layer in zip(global_masked_layers, client_masked_layers):
-                if global_layer.mask is not None:
-                    client_layer.mask = global_layer.mask.clone().to(client_model.device)
-                    if args.spar_wei == 1 and args.load_spar_wei == 1:
-                        client_layer.fixed_mask = True
-                    else:
-                        client_layer.fixed_mask = False
+            client_model.load_state_dict(global_model.state_dict())
         print('=' * 20 + "Global model has been distributed to all clients" + '=' * 20)
+
         all_train_results = []
         all_valid_results = []
         all_test_results = []
@@ -477,9 +554,9 @@ def main():
         all_client_train_flops = []
         all_client_eval_flops = []
         for client_idx in range(args.num_workers):
-
-            optimizer = optimizers[client_idx]
+            optimizer = optim.Adam(client_models[client_idx].parameters(), lr=args.lr)
             device = next(client_models[client_idx].parameters()).device
+
             train_idx = train_idx_list[client_idx].to(device)
             valid_idx = valid_idx_list[client_idx].to(device)
             test_idx = test_idx_list[client_idx].to(device)
@@ -491,13 +568,14 @@ def main():
                     temp = max(0.05, decay_temp)
                     logging.debug(f"Updated temperature: {temp}")
 
-                epoch_loss, sparsity,flops,wei_mask_ratio = train(
+                client_models[client_idx].train()
+                epoch_loss, sparsity, flops, wei_mask_ratio = train(
                     client_data[client_idx],
                     train_idx,
                     valid_idx,
                     test_idx,
                     client_models[client_idx],
-                    optimizer,criterion,
+                    optimizer, criterion,
                     temp,
                     device,
                     args,
@@ -508,10 +586,12 @@ def main():
                     print(f"Client {client_idx}:")
                 print(f"Inner Epoch {inner_epoch}, Loss: {epoch_loss:.4f}, sparse ratio: {100 * sparsity:.2f}%")
                 all_sparsity_innner_epoch.append(sparsity)
+
                 all_wei_mask_inner_ratio.append(wei_mask_ratio)
             all_sparsity.append(np.mean(all_sparsity_innner_epoch) if all_sparsity_innner_epoch else 0.0)
+
             all_wei_mask_ratio.append(np.mean(all_wei_mask_inner_ratio) if all_wei_mask_inner_ratio else 0.0)
-            result,eval_flops = multi_evaluate(
+            result, eval_flops = multi_evaluate(
                 client_data[client_idx],
                 client_models[client_idx],
                 evaluator,
@@ -529,89 +609,42 @@ def main():
             print(f"Client {client_idx} train flops: {total_flops_per_epoch}, eval flops: {total_flops_per_epoch_eval}")
             print(f"Client {client_idx} Weight Mask Ratio: {100 * np.mean(all_wei_mask_inner_ratio):.2f}%")
 
-        if args.spar_wei == 1:
-            global_model, client_models, communication_bytes,average_wei_mask_ratio = EAGLE_AGG(global_model, client_models, args)
-            total_upload_bytes += communication_bytes['upload_bytes']
-            total_download_bytes += communication_bytes['download_bytes']
-            total_bytes += communication_bytes['upload_bytes'] + communication_bytes['download_bytes']
-        else:
-            average_wei_mask_ratio = 1
-            global_model, upload_bytes, download_bytes = fed_avg(global_model, client_models)
-            communication_bytes = {
-                'upload_bytes': upload_bytes,
-                'download_bytes': download_bytes
-            }
-            total_upload_bytes += communication_bytes['upload_bytes']
-            total_download_bytes += communication_bytes['download_bytes']
-            total_bytes += communication_bytes['upload_bytes'] + communication_bytes['download_bytes']
-
-        if 'train' in result:
-            all_train_results.append(result['train']['rocauc'])
-        if 'valid' in result:
-            all_valid_results.append(result['valid']['rocauc'])
-        if 'test' in result:
-            all_test_results.append(result['test']['rocauc'])
+            if 'train' in result:
+                all_train_results.append(result['train']['rocauc'])
+            if 'valid' in result:
+                all_valid_results.append(result['valid']['rocauc'])
+            if 'test' in result:
+                all_test_results.append(result['test']['rocauc'])
         average_train_acc = np.mean(all_train_results) if all_train_results else 0.0
         average_valid_acc = np.mean(all_valid_results) if all_valid_results else 0.0
         average_test_acc = np.mean(all_test_results) if all_test_results else 0.0
         average_sparsity = np.mean(all_sparsity) if all_sparsity else 0.0
         average_train_flops = np.mean(all_client_train_flops) if all_client_train_flops else 0.0
         average_eval_flops = np.mean(all_client_eval_flops) if all_client_eval_flops else 0.0
+        average_wei_mask_ratio = np.mean(all_wei_mask_ratio) if all_wei_mask_ratio else 0.0
         print(f'Average Accuracy across all clients: train ROC AUC:{100 * average_train_acc:.2f}, '
               f'valid ROC AUC:{100 * average_valid_acc:.2f}, test ROC AUC:{100 * average_test_acc:.2f}%')
         print(f'Average Sparsity across all clients: {100 * average_sparsity:.2f}%')
-        print(f'Average FLOPs across all clients: train FLOPs:{average_train_flops}, eval FLOPs:{average_eval_flops}')
+        print(f'Average FLOPs across all clients: train FLOPs:{average_train_flops:.4f}, eval FLOPs:{average_eval_flops}')
         print(f'Average Weight Mask Ratio across all clients: {100 * average_wei_mask_ratio:.2f}%')
 
         with open(acc_file_path, 'a') as acc_file:
-            acc_file.write(f"Epoch:{epoch }, acc:{average_test_acc}, spar:{average_sparsity}, train_flops:{average_train_flops:.4f}, eval_flops:{average_eval_flops}, wei_mask_ratio:{average_wei_mask_ratio}, total_bytes:{total_bytes} \n")
+            acc_file.write(f"Epoch:{epoch }, acc:{average_test_acc}, spar:{average_sparsity}, train_flops:{average_train_flops:.4f}, eval_flops:{average_eval_flops}, wei_mask_ratio:{average_wei_mask_ratio}\n")
 
-        if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-            current_w2loss = args.w2loss
-            w2loss_history.append(current_w2loss)
-            pruning_rate_history.append(average_wei_mask_ratio)
-            current_pruning_ratio = average_wei_mask_ratio
-            current_pruning_percentage = current_pruning_ratio * 100
-            if lower_bound <= current_pruning_percentage <= upper_bound:
-                if average_test_acc > best_acc_within_range[current_pruning_point]:
-                    best_acc_within_range[current_pruning_point] = average_test_acc
-                    masks = [layer.mask.detach().cpu().clone() for layer in global_model.gnn.modules() if isinstance(layer, MaskedLinear)]
-                    best_mask_within_range[current_pruning_point] = masks
-                    print(f"The best accuracy for pruning rate {current_pruning_point}±{pruning_tolerance}% is updated: {average_test_acc:.4f}%")
-            elif current_pruning_percentage < lower_bound:
-                if current_pruning_index is not None and current_pruning_point is not None:
-                    if best_mask_within_range.get(current_pruning_point) is not None:
-                        masks = best_mask_within_range[current_pruning_point]
-                        mask_file_path = f"saved_wei/num_layers_{args.num_layers}_best_masks_pruning_{current_pruning_point}+-{pruning_tolerance}%.pth"
-                        torch.save(masks, mask_file_path)
-                        print(f"The mask for the optimal pruning rate {current_pruning_point}±{pruning_tolerance}% is saved to {mask_file_path}")
-                        load_masks_into_model(global_model, masks, fixed=True)
-                        print(f"A mask of pruning rate {current_pruning_point}±{pruning_tolerance}% has been loaded into global_model")
-                    else:
-                        print(f"The best mask for the pruning rate {current_pruning_point}±{pruning_tolerance}% was not recorded")
-                    current_pruning_index += 1
-                    if current_pruning_index < total_pruning_points:
-                        next_pruning_point = pruning_ranges[current_pruning_index]
-                        print(f"Switch to the next pruning rate point: {next_pruning_point}±{pruning_tolerance}%")
-                    else:
-                        print("All pruning rate points have been processed.")
+        # Use the new aggregation function
+        if args.spar_wei == 1:
+            global_model = my_fedaggregation(global_model, client_models, args)
+        else:
+            global_model = fed_avg(global_model, client_models)
+        for client_model in client_models:
+            client_model.load_state_dict(global_model.state_dict())
 
-            if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-                epochs_remaining = args.epochs - (current_epoch + 1)
-                if epochs_remaining <= 10 and (current_pruning_ratio * 100) > 4:
-                    args.epochs += 10
-                    print(f"The number of training rounds was extended by 10 rounds. New total rounds: {args.epochs}")
-            if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-                if average_wei_mask_ratio <= 0.04:
-                    print("End training early if the parameter sparsification rate has reached 4% or less.")
-                    masks = [layer.mask.detach().cpu().clone() for layer in global_model.gnn.modules() if
-                             isinstance(layer, MaskedLinear)]
-                    final_mask_file_path = f"saved_wei/num_layers_{args.num_layers}_final_masks_pruning_0+-4%.pth"
-                    torch.save(masks, final_mask_file_path)
-                    print(f"A mask with a final pruning rate of 0±4% is saved to {final_mask_file_path}")
-                    break
-        print("Training completed.")
+        logging.debug("Performed federated aggregation.")
+        logging.info(f"Round {epoch} Results: {result}")
 
+    end_time = time.time()
+    total_time = end_time - start_time
+    logging.info(f'Total time: {time.strftime("%H:%M:%S", time.gmtime(total_time))}')
 
 if __name__ == "__main__":
     main()
