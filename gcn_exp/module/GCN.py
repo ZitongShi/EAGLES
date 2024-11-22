@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from ogbn_arxiv.module.gnn import MaskedLinear
 
 class GCN(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, dropout=0.5, lr=0.01, weight_decay=5e-4, layer=3, device=None,
+    def __init__(self, nfeat, nhid, nclass, dropout=0.5, lr=0.01, weight_decay=5e-4, layer=2, device=None,
                  layer_norm_first=True, use_ln=True, spar_wei=False):
         super(GCN, self).__init__()
 
@@ -105,11 +105,11 @@ class GCNConvCustom(MessagePassing):
 
         self.lin_l = MaskedLinear(in_channels[0], out_channels, bias=bias, spar_wei=spar_wei) if spar_wei else nn.Linear(in_channels[0], out_channels, bias=bias)
         if spar_wei:
-            self.lin_r = MaskedLinear(in_channels[1], out_channels, bias=False, spar_wei=True)  # GCN 通常没有 root_weight
+            self.lin_r = MaskedLinear(in_channels[1], out_channels, bias=False, spar_wei=True)
             print(f"Initialized MaskedLinear layer: {self.lin_l}")
             print(f"Initialized MaskedLinear root layer: {self.lin_r}")
         else:
-            self.lin_r = nn.Linear(in_channels[1], out_channels, bias=False)  # GCN 通常没有 root_weight
+            self.lin_r = nn.Linear(in_channels[1], out_channels, bias=False)
             print(f"Initialized Linear layer: {self.lin_l}")
             print(f"Initialized Linear root layer: {self.lin_r}")
 

@@ -21,7 +21,7 @@ class model(nn.Module):
                           expert_select=args['expert_select'],
                           lam=args['lam'],
                           )
-        if args['dataset'] == 'ogbn-arxiv':
+        if args['dataset'] == 'ogbn-arxiv' or args['dataset'] == 'ogbn-products':
             self.gnn = SAGE(
                 in_channels=num_features,
                 hidden_channels=args["hidden_channels"],
