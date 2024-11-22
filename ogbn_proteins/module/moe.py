@@ -28,10 +28,10 @@ class BinaryStep(torch.autograd.Function):
 
 
 
-class MoE(nn.Module):
+class moe(nn.Module):
 
     def __init__(self, input_size,hidden_size, num_experts,nlayers,activation,k_list,expert_select ,noisy_gating=True, coef=1e-2,lam=1):
-        super(MoE, self).__init__()
+        super(moe, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
         self.k = expert_select # an integer - how many experts to use for each batch element
