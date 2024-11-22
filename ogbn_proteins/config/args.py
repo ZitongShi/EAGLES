@@ -10,7 +10,7 @@ import glob
 
 class ArgsInit(object):
     def __init__(self):
-        parser = argparse.ArgumentParser(description='MoG(proteins)')
+        parser = argparse.ArgumentParser(description='PROTEINS')
         # dataset
         parser.add_argument('--dataset', type=str, default='ogbn-proteins',
                             help='dataset name (default: ogbn-proteins)')
