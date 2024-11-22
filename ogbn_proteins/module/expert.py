@@ -24,7 +24,6 @@ class BinaryStep(torch.autograd.Function):
 
 eps = 1e-8
 class Expert(nn.Module):
-    """Sparsification learner"""
     def __init__(self, nlayers, in_dim, hidden, activation, k, weight=True, metric=None, processors=None):
         super().__init__()
 
@@ -44,16 +43,8 @@ class Expert(nn.Module):
         for layer in self.layers:
             nn.init.xavier_uniform_(layer.weight)
 
-    def internal_forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = layer(x)
-            if i != self.nlayers - 1:
-                x = self.activation(x)
-        return x
-
     def gumbel_softmax_sample(self, indices,values, temperature, training):
-        """Draw a sample from the Gumbel-Softmax distribution"""
-        r = self.sample_gumble(values.shape) 
+        r = self.sample_gumble(values.shape)
         if training is not None:
             values = torch.log(values) + r.to(indices.device)
         else:
@@ -62,10 +53,6 @@ class Expert(nn.Module):
         y = torch.sparse_coo_tensor(indices=indices, values=values,requires_grad=True)
         return torch.sparse.softmax(y, dim=1)
 
-    def sample_gumble(self, shape):
-        """Sample from Gumbel(0, 1)"""
-        U = torch.rand(shape)
-        return -torch.log(-torch.log(U + eps) + eps)
 
     def forward(self, features, indices,values, temperature,training=None):
         # print("indices shape:",indices.shape)
@@ -79,17 +66,15 @@ class Expert(nn.Module):
         temp = torch.cat([f1_features,f2_features,auv],-1)
         temp = self.internal_forward(temp)
         z = torch.reshape(temp, [-1])
-        z = F.normalize(z,dim=0)
-        z = z
         z_matrix = torch.sparse_coo_tensor(indices=indices, values=z,requires_grad=True)
         pi = torch.sparse.softmax(z_matrix, dim=1) 
         pi_values = pi.coalesce().values()
-        y = self.gumbel_softmax_sample(indices,pi_values, temperature, training) # sparse score
+        y = self.gumbel_softmax_sample(indices,pi_values, temperature, training)
         sparse_indices = y.coalesce().indices()
         sparse_values = y.coalesce().values()
-        node_idx, num_edges_per_node = sparse_indices[0].unique(return_counts=True)
+        num_edges_per_node = sparse_indices[0].unique(return_counts=True)
         k_edges_per_node = (num_edges_per_node.float() * self.k).round().long()
-        sparse_values,val_sort_idx = sparse_values.sort(descending=True) 
+        val_sort_idx = sparse_values.sort(descending=True)
         sparse_idx0 = sparse_indices[0].index_select(dim = -1,index = val_sort_idx)  
         idx_sort_idx = sparse_idx0.argsort(stable=True,dim=-1,descending = False) 
         scores_sorted = sparse_values.index_select(dim=-1,index=idx_sort_idx) 
