@@ -34,12 +34,11 @@ class moe(nn.Module):
         super(moe, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
-        self.k = expert_select # an integer - how many experts to use for each batch element
+        self.k = expert_select
         self.loss_coef = coef
         self.k_list = k_list
-        # instantiate experts
         self.experts = nn.ModuleList([Expert(nlayers=nlayers, in_dim=input_size * 2 + 8, hidden=hidden_size, activation=activation, k=k) for k in k_list])
-        self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)  # gate从(edge_num,feature)到(edge_num,experts)
+        self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
         self.w_noise = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
         self.lam = lam
         self.topo_val =None
