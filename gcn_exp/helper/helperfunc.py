@@ -14,7 +14,7 @@ def fed_avg(global_model, client_models):
     for client_model in client_models:
         client_dict = client_model.state_dict()
         for key in global_dict.keys():
-            global_dict[key] += client_dict[key].to(global_dict[key].device)  # 确保在相同设备
+            global_dict[key] += client_dict[key].to(global_dict[key].device)
     for key in global_dict.keys():
         global_dict[key] = global_dict[key] / len(client_models)
     global_model.load_state_dict(global_dict)
