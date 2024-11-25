@@ -43,17 +43,22 @@ class Expert(nn.Module):
         for layer in self.layers:
             nn.init.xavier_uniform_(layer.weight)
 
-    def gumbel_softmax_sample(self, indices,values, temperature, training):
-        r = self.sample_gumble(values.shape)
+    def hard_concrete_sample(self, indices, values, temperature, training):
+
+        r = self.sample_uniform_noise(values.shape)
         if training is not None:
-            values = torch.log(values) + r.to(indices.device)
+            values = torch.log(values + eps) + r.to(indices.device)
         else:
-            values = torch.log(values)
+            values = torch.log(values + eps)
         values /= temperature
-        y = torch.sparse_coo_tensor(indices=indices, values=values,requires_grad=True)
+        stretched_values = torch.sigmoid(values)
+        hard_values = torch.clamp(stretched_values, min=0, max=1)
+        y = torch.sparse_coo_tensor(indices=indices, values=hard_values, requires_grad=True)
         return torch.sparse.softmax(y, dim=1)
 
-
+    def sample_uniform_noise(shape):
+        U = torch.rand(shape)
+        return torch.log(U + eps) - torch.log(1 - U + eps)
     def forward(self, features, indices,values, temperature,training=None):
         # print("indices shape:",indices.shape)
         #pdb.set_trace()
@@ -69,7 +74,7 @@ class Expert(nn.Module):
         z_matrix = torch.sparse_coo_tensor(indices=indices, values=z,requires_grad=True)
         pi = torch.sparse.softmax(z_matrix, dim=1) 
         pi_values = pi.coalesce().values()
-        y = self.gumbel_softmax_sample(indices,pi_values, temperature, training)
+        y = self.hard_concrete_sample(indices, pi_values, temperature, training)
         sparse_indices = y.coalesce().indices()
         sparse_values = y.coalesce().values()
         num_edges_per_node = sparse_indices[0].unique(return_counts=True)
