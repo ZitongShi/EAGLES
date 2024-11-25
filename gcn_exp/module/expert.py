@@ -25,7 +25,6 @@ class BinaryStep(torch.autograd.Function):
 
 
 class SpLearner(nn.Module):
-    """Sparsification learner"""
     def __init__(self, nlayers, in_dim, hidden, activation, k, weight=True, metric=None, processors=None):
         super().__init__()
 
@@ -51,22 +50,23 @@ class SpLearner(nn.Module):
             if i != self.nlayers - 1:
                 x = self.activation(x)
         return x
+    def sample_uniform_noise(self, shape):
+        U = torch.rand(shape)
+        return torch.log(U + eps) - torch.log(1 - U + eps)
 
-    def gumbel_softmax_sample(self, indices,values, temperature, shape, training):
-        """Draw a sample from the Gumbel-Softmax distribution"""
-        r = self.sample_gumble(values.shape)
+    def hard_concrete_sample(self, indices, values, temperature, shape, training):
+
+        r = self.sample_uniform_noise(values.shape)
         if training is not None:
-            values = torch.log(values) + r.to(indices.device)
+            values = torch.log(values + eps) + r.to(indices.device)
         else:
-            values = torch.log(values)
+            values = torch.log(values + eps)
         values /= temperature
-        y = torch.sparse_coo_tensor(indices=indices, values=values, size=shape,requires_grad=True)
+        stretched_values = torch.sigmoid(values)
+        hard_values = torch.clamp(stretched_values, min=0, max=1)
+        y = torch.sparse_coo_tensor(indices=indices, values=hard_values, size=shape, requires_grad=True)
         return torch.sparse.softmax(y, dim=1)
 
-    def sample_gumble(self, shape):
-        """Sample from Gumbel(0, 1)"""
-        U = torch.rand(shape)
-        return -torch.log(-torch.log(U + eps) + eps)
 
     def forward(self, features, indices, values, shape, temperature, training=None):
         f1_features = torch.index_select(features, 0, indices[0, :])
@@ -82,7 +82,7 @@ class SpLearner(nn.Module):
         z_matrix = torch.sparse_coo_tensor(indices=indices, values=z, size=shape, requires_grad=True)
         pi = torch.sparse.softmax(z_matrix, dim=1)
         pi_values = pi.coalesce().values()
-        y = self.gumbel_softmax_sample(indices, pi_values, temperature, shape, training)  # sparse score
+        y = self.hard_concrete_sample(indices, pi_values, temperature, shape, training)  # sparse score
         sparse_indices = y.coalesce().indices()
         sparse_values = y.coalesce().values()
 
