@@ -417,23 +417,6 @@ def main():
                     else:
                         print("All pruning rate points have been processed.")
 
-            if args['spar_wei'] == 1 and args['load_spar_wei'] == 0 and args['save_spar_wei'] == 1:
-                epochs_remaining = args['epochs'] - (current_epoch + 1)
-                if epochs_remaining <= 10 and (current_pruning_ratio * 100) > 4:
-                    args['epochs'] += 10
-                    print(f"Extending training epochs by 10. New total epochs: {args['epochs']}")
-            if args['spar_wei'] == 1 and args['load_spar_wei'] == 0 and args['save_spar_wei'] == 1:
-                if average_wei_mask_ratio <= 0.04:
-                    print("Parameter sparsity rate has reached 4% or below, ending training early.")
-                    masks = [layer.mask.detach().cpu().clone() for layer in global_model.gnn.modules() if
-                             isinstance(layer, MaskedLinear)]
-                    if args['dataset'] == 'ogbn-arxiv':
-                        final_mask_file_path = f"saved_wei/num_layers_{args['num_layers']}_best_masks_pruning_0+-4%.pth"
-                    else:
-                        final_mask_file_path = f"saved_wei/{args['dataset']}_num_layers_{args['num_layers']}_best_masks_pruning_0+-4%.pth"
-                    torch.save(masks, final_mask_file_path)
-                    print(f"Final mask for pruning rate 0±4% has been saved to {final_mask_file_path}")
-                    break
         current_epoch += 1
         print("Training completed.")
 
