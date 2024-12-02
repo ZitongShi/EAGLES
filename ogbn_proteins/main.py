@@ -443,20 +443,6 @@ def main():
                     else:
                         print("All pruning rate points have been processed.")
 
-            if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-                epochs_remaining = args.epochs - (current_epoch + 1)
-                if epochs_remaining <= 10 and (current_pruning_ratio * 100) > 4:
-                    args.epochs += 10
-                    print(f"The number of training rounds was extended by 10 rounds. New total rounds: {args.epochs}")
-            if args.spar_wei == 1 and args.load_spar_wei == 0 and args.save_spar_wei == 1:
-                if average_wei_mask_ratio <= 0.04:
-                    print("End training early if the parameter sparsification rate has reached 4% or less.")
-                    masks = [layer.mask.detach().cpu().clone() for layer in global_model.gnn.modules() if
-                             isinstance(layer, MaskedLinear)]
-                    final_mask_file_path = f"saved_wei/num_layers_{args.num_layers}_final_masks_pruning_0+-4%.pth"
-                    torch.save(masks, final_mask_file_path)
-                    print(f"A mask with a final pruning rate of 0±4% is saved to {final_mask_file_path}")
-                    break
         print("Training completed.")
 
 
