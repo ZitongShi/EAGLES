@@ -1,4 +1,4 @@
-# CVPR25_EAGLES
+# EAGLES
 
 ## Abstarct
 
