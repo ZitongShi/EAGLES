@@ -7,10 +7,12 @@ Federated graph learning has swiftly gained attention as a privacy-preserving ap
 
 ## Citation
 ```
-@inproceedings{EAGLES_ICML25,
-  title={EAGLES: Towards Effective, Efficient, and Economical Federated Graph Learning via Unified Sparsification},
-  author={Shi, Zitong and Wan, Guancheng and Huang, Wenke and Zhang, Guibin and Tao, Dacheng and Ye, Mang},
-  booktitle={International Conference on Machine Learning},
-  year={2025}
+@inproceedings{
+shi2025eagles,
+title={{EAGLES}: Towards Effective, Efficient, and Economical Federated Graph Learning via Unified Sparsification},
+author={Zitong Shi and Guancheng Wan and Wenke Huang and Guibin Zhang and He Li and Carl Yang and Mang Ye},
+booktitle={Forty-second International Conference on Machine Learning},
+year={2025},
+url={https://openreview.net/forum?id=Bd9JlrqZhN}
 }
 ```
