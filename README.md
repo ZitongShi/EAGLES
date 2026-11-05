@@ -1,5 +1,4 @@
 # EAGLES
-> Zitong Shi, Guancheng Wan, Wenke Huang, Guibin Zhang, He Li, Carl Yang, Mang Ye
 
 ## Abstarct
 
